@@ -1,0 +1,27 @@
+[
+  {
+    "Name": "LogRotate",
+    "Server": "localhost",
+    "Schedule": "daily",
+    "ExpectedHour": 3,
+    "MaxDurationMin": 30,
+    "Critical": false
+  },
+  {
+    "Name": "Auto-WindowsUpdate",
+    "Server": "localhost",
+    "Schedule": "weekly",
+    "ExpectedDay": "Sunday",
+    "ExpectedHour": 2,
+    "MaxDurationMin": 180,
+    "Critical": true
+  },
+  {
+    "Name": "AD_PasswordAudit",
+    "Server": "localhost",
+    "Schedule": "monthly",
+    "ExpectedDay": 1,
+    "MaxDurationMin": 10,
+    "Critical": false
+  }
+]
