@@ -7,17 +7,40 @@
     Skripty importuji tento modul a volaji Start na zacatku, Stop na konci.
     Vysledky se zapisuji do Windows Event Log (Application, Source: ScriptMonitor).
 .NOTES
-    Verze: 1.0 (2026-04-15)
+    Verze: 1.1 (2026-04-17)
     Autor: Petr Pavlas
 #>
 
 Set-StrictMode -Version 2.0
 
-# Interni stav modulu — slovnik aktivnich behu (klic = ScriptName)
-$script:ActiveRuns = @{}
+# Interni stav modulu — ordered slovnik aktivnich behu (klic = ScriptName).
+# Ordered dictionary garantuje insertion order pro "posledni aktivni" fallback.
+$script:ActiveRuns = [ordered]@{}
 
 # Cesta k fallback logu pokud Event Log neni dostupny
 $script:FallbackLogPath = Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Definition) 'fallback.log'
+
+$script:MonitorSourceName = 'ScriptMonitor'
+
+function Test-MonitorEventSource {
+    <#
+    .SYNOPSIS
+        Wrapper nad [System.Diagnostics.EventLog]::SourceExists, ktery lze mockovat v testech.
+    #>
+    [CmdletBinding()]
+    param()
+    return [System.Diagnostics.EventLog]::SourceExists($script:MonitorSourceName)
+}
+
+function Format-MonitorFieldValue {
+    <#
+    .SYNOPSIS
+        Sanitizuje hodnotu pole — odstrani CR/LF aby se nerozbily key:value radky v Event Log zprave.
+    #>
+    param([string]$Value)
+    if ($null -eq $Value) { return '' }
+    return ($Value -replace "[`r`n]+", ' ').Trim()
+}
 
 function Write-MonitorEvent {
     <#
@@ -30,26 +53,47 @@ function Write-MonitorEvent {
         [System.Diagnostics.EventLogEntryType]$EntryType = 'Information'
     )
 
-    $sourceName = 'ScriptMonitor'
-
     try {
-        if (-not [System.Diagnostics.EventLog]::SourceExists($sourceName)) {
-            throw "Event Source '$sourceName' neni registrovan. Spustte Install-ScriptMonitor.ps1."
+        if (-not (Test-MonitorEventSource)) {
+            throw "Event Source '$script:MonitorSourceName' neni registrovan. Spustte Install-ScriptMonitor.ps1."
         }
-        Write-EventLog -LogName 'Application' -Source $sourceName `
+        Write-EventLog -LogName 'Application' -Source $script:MonitorSourceName `
             -EventId $EventId -EntryType $EntryType -Message $Message
     }
     catch {
-        # Fallback — zapis do souboru
+        # Fallback — zapis do souboru jednim volanim (atomicky vzhledem ke kolegum).
         $fallbackDir = Split-Path -Parent $script:FallbackLogPath
         if ($fallbackDir -and -not (Test-Path $fallbackDir)) {
             New-Item -ItemType Directory -Path $fallbackDir -Force | Out-Null
         }
         $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-        "[$timestamp] EventId=$EventId EntryType=$EntryType FALLBACK (EventLog nedostupny: $($_.Exception.Message))" |
-            Out-File $script:FallbackLogPath -Append
-        "$Message" | Out-File $script:FallbackLogPath -Append
-        '---' | Out-File $script:FallbackLogPath -Append
+        $block = @(
+            "[$timestamp] EventId=$EventId EntryType=$EntryType FALLBACK (EventLog nedostupny: $($_.Exception.Message))"
+            $Message
+            '---'
+            ''
+        ) -join [Environment]::NewLine
+
+        # FileShare.ReadWrite + Append → odolne vuci soubeznym zapisum z jinych procesu.
+        try {
+            $stream = [System.IO.File]::Open(
+                $script:FallbackLogPath,
+                [System.IO.FileMode]::Append,
+                [System.IO.FileAccess]::Write,
+                [System.IO.FileShare]::ReadWrite
+            )
+            try {
+                $bytes = [System.Text.Encoding]::UTF8.GetBytes($block)
+                $stream.Write($bytes, 0, $bytes.Length)
+            }
+            finally {
+                $stream.Dispose()
+            }
+        }
+        catch {
+            # Posledni rezerva — pokud i fallback selze, nechceme padnout skript.
+            Write-Warning "ScriptMonitor fallback log selhal: $($_.Exception.Message)"
+        }
     }
 }
 
@@ -68,17 +112,24 @@ function Start-ScriptMonitor {
         [string]$Version = '0.0'
     )
 
+    $safeName    = Format-MonitorFieldValue $ScriptName
+    $safeVersion = Format-MonitorFieldValue $Version
+
     $run = @{
-        ScriptName = $ScriptName
-        Version    = $Version
+        ScriptName = $safeName
+        Version    = $safeVersion
         StartTime  = Get-Date
         Server     = $env:COMPUTERNAME
     }
-    $script:ActiveRuns[$ScriptName] = $run
+    # Pokud uz existuje, nahradime (restart skriptu bez Stop volani).
+    if ($script:ActiveRuns.Contains($safeName)) {
+        $script:ActiveRuns.Remove($safeName)
+    }
+    $script:ActiveRuns[$safeName] = $run
 
     $message = @(
-        "ScriptName: $ScriptName"
-        "Version: $Version"
+        "ScriptName: $safeName"
+        "Version: $safeVersion"
         "Action: STARTED"
         "Server: $($env:COMPUTERNAME)"
         "StartTime: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
@@ -92,7 +143,7 @@ function Stop-ScriptMonitor {
     .SYNOPSIS
         Zaznamenava ukonceni skriptu (EventID 1000/1001/1002) vcetne statistik.
     .PARAMETER ScriptName
-        Nazev skriptu. Pokud neuvedeno, pouzije posledni spusteny.
+        Nazev skriptu. Pokud neuvedeno, pouzije posledni spusteny (insertion order).
     .PARAMETER ExitCode
         Exit kod skriptu (0 = uspech).
     .PARAMETER ErrorCount
@@ -111,16 +162,25 @@ function Stop-ScriptMonitor {
         [string]$Details = ''
     )
 
-    # Pokud neni ScriptName, pouzij posledni aktivni
+    # Pokud neni ScriptName, pouzij posledni aktivni (ordered dict — insertion order).
     if (-not $ScriptName -and $script:ActiveRuns.Count -gt 0) {
-        $ScriptName = ($script:ActiveRuns.Keys | Select-Object -Last 1)
+        # Hledej zaznam s nejnovejsim StartTime (odolnejsi nez spolehat se na klicove poradi).
+        $latest = $null
+        foreach ($entry in $script:ActiveRuns.GetEnumerator()) {
+            if (-not $latest -or $entry.Value.StartTime -gt $latest.Value.StartTime) {
+                $latest = $entry
+            }
+        }
+        if ($latest) { $ScriptName = $latest.Key }
     }
+
+    $ScriptName = Format-MonitorFieldValue $ScriptName
 
     # Vypocitej dobu behu
     $duration = [TimeSpan]::Zero
     $version = '0.0'
     $server = $env:COMPUTERNAME
-    if ($ScriptName -and $script:ActiveRuns.ContainsKey($ScriptName)) {
+    if ($ScriptName -and $script:ActiveRuns.Contains($ScriptName)) {
         $run = $script:ActiveRuns[$ScriptName]
         $duration = (Get-Date) - $run.StartTime
         $version = $run.Version
@@ -145,7 +205,14 @@ function Stop-ScriptMonitor {
         $entryType = [System.Diagnostics.EventLogEntryType]::Information
     }
 
-    $durationFormatted = '{0:hh\:mm\:ss}' -f $duration
+    # Format "d.hh:mm:ss" aby se nesplyla >24h trvani (jinak by se hodiny orezaly modulo 24).
+    if ($duration.TotalDays -ge 1) {
+        $durationFormatted = '{0:d\.hh\:mm\:ss}' -f $duration
+    } else {
+        $durationFormatted = '{0:hh\:mm\:ss}' -f $duration
+    }
+
+    $safeDetails = Format-MonitorFieldValue $Details
 
     $message = @(
         "ScriptName: $ScriptName"
@@ -154,11 +221,11 @@ function Stop-ScriptMonitor {
         "ExitCode: $ExitCode"
         "ItemsProcessed: $ItemsProcessed"
         "ErrorCount: $ErrorCount"
-        "Details: $Details"
+        "Details: $safeDetails"
         "Server: $server"
     ) -join "`n"
 
     Write-MonitorEvent -EventId $eventId -Message $message -EntryType $entryType
 }
 
-Export-ModuleMember -Function Start-ScriptMonitor, Stop-ScriptMonitor
+Export-ModuleMember -Function Start-ScriptMonitor, Stop-ScriptMonitor, Test-MonitorEventSource

@@ -13,7 +13,7 @@
 .PARAMETER LookbackHours
     Jak daleko zpet v Event Logu hledat (vychozi: 48 hodin).
 .NOTES
-    Verze: 1.0 (2026-04-15)
+    Verze: 1.1 (2026-04-17)
     Autor: Petr Pavlas
     Schedule: Task Scheduler, kazdych 30 minut
 #>
@@ -28,14 +28,26 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 2.0
 
-$ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
-if (-not $RegistryPath) { $RegistryPath = Join-Path $ScriptDir 'scripts-registry.json' }
-if (-not $OutputPath)   { $OutputPath = Join-Path $ScriptDir 'dashboard.html' }
+# --- Konstanty ---
+# Max hodin od posledniho behu nez je skript povazovan za MISSING (podle schedule).
+# Hodnoty zahrnuji "grace period" — napr. daily = 24h + 12h rezerva = 36h.
+$script:MaxHoursBySchedule = @{
+    daily   = 36    # 1 den + 12h grace
+    weekly  = 192   # 8 dni (7 + 1 grace)
+    monthly = 792   # 33 dni
+}
+$script:DefaultMaxHours         = 48
+$script:DefaultMaxRunningMin    = 60
+$script:MaxEventsPerServer      = 500
+# Bile povolene klice z Event Log parseru — zabrani prepsani poli pres multi-line Details.
+$script:AllowedMessageKeys = @(
+    'ScriptName','Version','Action','Duration','ExitCode',
+    'ItemsProcessed','ErrorCount','Details','Server','StartTime'
+)
+$script:ValidSchedules = @('daily','weekly','monthly')
 
-# Nacteni registru
-$registry = Get-Content $RegistryPath -Raw | ConvertFrom-Json
-
-# Parsovani Event Log zpravy do hashtable
+# Parsovani Event Log zpravy do hashtable.
+# First-match wins — zabrani override poli pres malicious multi-line Details.
 function ConvertFrom-MonitorMessage {
     param([Parameter(Mandatory)][string]$RawMessage)
 
@@ -43,13 +55,30 @@ function ConvertFrom-MonitorMessage {
     foreach ($line in $RawMessage -split "`n") {
         $line = $line.Trim()
         if ($line -match '^(\w+):\s*(.*)$') {
-            $result[$Matches[1]] = $Matches[2]
+            $key = $Matches[1]
+            if ($script:AllowedMessageKeys -notcontains $key) { continue }
+            if ($result.ContainsKey($key)) { continue }
+            $result[$key] = $Matches[2]
         }
     }
     return $result
 }
 
-# Stazeni eventu ze serveru (lokalni nebo remote)
+# Validace polozky registru — povinna pole a jejich typy.
+function Test-RegistryEntry {
+    param([Parameter(Mandatory)]$Entry)
+
+    foreach ($field in @('Name','Server','Schedule')) {
+        if (-not ($Entry.PSObject.Properties.Name -contains $field) -or -not $Entry.$field) {
+            throw "Registry entry postrada povinne pole '$field': $($Entry | ConvertTo-Json -Compress)"
+        }
+    }
+    if ($script:ValidSchedules -notcontains $Entry.Schedule) {
+        throw "Registry entry '$($Entry.Name)': neplatny Schedule '$($Entry.Schedule)' (povolene: $($script:ValidSchedules -join ', '))."
+    }
+}
+
+# Stazeni eventu ze serveru (lokalni nebo remote).
 function Get-MonitorEvents {
     param(
         [string]$ServerName = 'localhost',
@@ -64,108 +93,122 @@ function Get-MonitorEvents {
 
     $params = @{
         FilterHashtable = $filterHash
-        MaxEvents       = 500
+        MaxEvents       = $script:MaxEventsPerServer
         ErrorAction     = 'SilentlyContinue'
     }
-    if ($ServerName -ne 'localhost' -and $ServerName -ne $env:COMPUTERNAME) {
+    $isRemote = $ServerName -ne 'localhost' -and $ServerName -ne $env:COMPUTERNAME
+    if ($isRemote) {
         $params['ComputerName'] = $ServerName
     }
 
     $events = Get-WinEvent @params
-    if (-not $events) { return @() }
+    if (-not $events) {
+        if ($isRemote) {
+            Write-Warning "Z remote serveru '$ServerName' nebyly nacteny zadne eventy (server mimo provoz, WinRM nedostupny, nebo zadne zaznamy v poslednich $Hours h)."
+        }
+        return @()
+    }
 
     return $events | ForEach-Object {
         $parsed = ConvertFrom-MonitorMessage -RawMessage $_.Message
         [PSCustomObject]@{
-            EventId    = $_.Id
-            TimeCreated = $_.TimeCreated
-            EntryType  = $_.LevelDisplayName
-            ScriptName = $parsed['ScriptName']
-            Version    = $parsed['Version']
-            Duration   = $parsed['Duration']
-            ExitCode   = $parsed['ExitCode']
+            EventId        = $_.Id
+            TimeCreated    = $_.TimeCreated
+            EntryType      = $_.LevelDisplayName
+            ScriptName     = $parsed['ScriptName']
+            Version        = $parsed['Version']
+            Duration       = $parsed['Duration']
+            ExitCode       = $parsed['ExitCode']
             ItemsProcessed = $parsed['ItemsProcessed']
-            ErrorCount = $parsed['ErrorCount']
-            Details    = $parsed['Details']
-            Server     = $parsed['Server']
+            ErrorCount     = $parsed['ErrorCount']
+            Details        = $parsed['Details']
+            Server         = $parsed['Server']
         }
     }
 }
 
-# Vyhodnoceni statusu jednoho skriptu na zaklade registru a eventu
+# Vyhodnoceni statusu jednoho skriptu na zaklade registru a eventu.
 function Get-ScriptStatus {
     param(
         [Parameter(Mandatory)]$RegistryEntry,
         [array]$Events
     )
 
-    # Filtrace eventu pro tento skript
-    $scriptEvents = $Events | Where-Object { $_.ScriptName -eq $RegistryEntry.Name } |
-        Sort-Object TimeCreated -Descending
+    # Filtrace eventu pro tento skript.
+    $scriptEvents = @($Events | Where-Object { $_.ScriptName -eq $RegistryEntry.Name } |
+        Sort-Object TimeCreated -Descending)
 
     # Zadne eventy = MISSING
-    if (-not $scriptEvents -or $scriptEvents.Count -eq 0) {
+    if ($scriptEvents.Count -eq 0) {
         return [PSCustomObject]@{
-            Name          = $RegistryEntry.Name
-            Server        = $RegistryEntry.Server
-            Status        = 'MISSING'
-            LastRun       = $null
-            Duration      = $null
-            Details       = 'Zadny zaznam v Event Logu'
-            ExitCode      = $null
-            Critical      = [bool]$RegistryEntry.Critical
-            RecentRuns    = @()
+            Name       = $RegistryEntry.Name
+            Server     = $RegistryEntry.Server
+            Status     = 'MISSING'
+            LastRun    = $null
+            Duration   = $null
+            Details    = 'Zadny zaznam v Event Logu'
+            ExitCode   = $null
+            Critical   = [bool]$RegistryEntry.Critical
+            RecentRuns = @()
         }
     }
 
-    # Posledni STOP event (1000, 1001, 1002)
+    # Posledni STOP event (1000, 1001, 1002).
     $lastStop = $scriptEvents | Where-Object { $_.EventId -in @(1000, 1001, 1002) } | Select-Object -First 1
-
-    # Posledni START event (1003)
+    # Posledni START event (1003).
     $lastStart = $scriptEvents | Where-Object { $_.EventId -eq 1003 } | Select-Object -First 1
 
-    # Detekce RUNNING — ma START ale zadny novejsi STOP
+    # Detekce RUNNING — ma START ale zadny novejsi STOP.
     if ($lastStart -and (-not $lastStop -or $lastStart.TimeCreated -gt $lastStop.TimeCreated)) {
         $runningMinutes = ((Get-Date) - $lastStart.TimeCreated).TotalMinutes
-        $maxMin = if ($RegistryEntry.MaxDurationMin) { $RegistryEntry.MaxDurationMin } else { 60 }
+        $maxMin = if ($RegistryEntry.PSObject.Properties.Name -contains 'MaxDurationMin' -and $RegistryEntry.MaxDurationMin) {
+            [int]$RegistryEntry.MaxDurationMin
+        } else {
+            $script:DefaultMaxRunningMin
+        }
         $status = if ($runningMinutes -gt $maxMin) { 'ERROR' } else { 'RUNNING' }
+        $details = if ($status -eq 'ERROR') {
+            "Bezi prilis dlouho ($([math]::Round($runningMinutes)) min, limit $maxMin min)"
+        } else {
+            'Probiha...'
+        }
 
         return [PSCustomObject]@{
-            Name          = $RegistryEntry.Name
-            Server        = $RegistryEntry.Server
-            Status        = $status
-            LastRun       = $lastStart.TimeCreated
-            Duration      = "{0:N0} min (bezi)" -f $runningMinutes
-            Details       = if ($status -eq 'ERROR') { "Bezi prilis dlouho ($([math]::Round($runningMinutes)) min, limit $maxMin min)" } else { 'Probiha...' }
-            ExitCode      = $null
-            Critical      = [bool]$RegistryEntry.Critical
-            RecentRuns    = @()
+            Name       = $RegistryEntry.Name
+            Server     = $RegistryEntry.Server
+            Status     = $status
+            LastRun    = $lastStart.TimeCreated
+            Duration   = '{0:N0} min (bezi)' -f $runningMinutes
+            Details    = $details
+            ExitCode   = $null
+            Critical   = [bool]$RegistryEntry.Critical
+            RecentRuns = @()
         }
     }
 
-    # Status dle posledniho STOP eventu
+    # Status dle posledniho STOP eventu.
     $status = switch ($lastStop.EventId) {
-        1000 { 'OK' }
-        1001 { 'WARNING' }
-        1002 { 'ERROR' }
+        1000    { 'OK' }
+        1001    { 'WARNING' }
+        1002    { 'ERROR' }
+        default { 'ERROR' }
     }
 
-    # Kontrola jestli beh probehl v ocekavanem intervalu
+    # Kontrola jestli beh probehl v ocekavanem intervalu.
     if ($status -eq 'OK') {
         $hoursSinceRun = ((Get-Date) - $lastStop.TimeCreated).TotalHours
-        $maxHours = switch ($RegistryEntry.Schedule) {
-            'daily'   { 36 }
-            'weekly'  { 192 }
-            'monthly' { 792 }
-            default   { 48 }
+        $maxHours = if ($script:MaxHoursBySchedule.ContainsKey($RegistryEntry.Schedule)) {
+            $script:MaxHoursBySchedule[$RegistryEntry.Schedule]
+        } else {
+            $script:DefaultMaxHours
         }
         if ($hoursSinceRun -gt $maxHours) {
             $status = 'MISSING'
         }
     }
 
-    # Poslednich 5 STOP behu pro detail
-    $recentRuns = $scriptEvents |
+    # Poslednich 5 STOP behu pro detail.
+    $recentRuns = @($scriptEvents |
         Where-Object { $_.EventId -in @(1000, 1001, 1002) } |
         Select-Object -First 5 |
         ForEach-Object {
@@ -176,22 +219,36 @@ function Get-ScriptStatus {
                 Items    = $_.ItemsProcessed
                 Details  = $_.Details
             }
-        }
+        })
 
     return [PSCustomObject]@{
-        Name          = $RegistryEntry.Name
-        Server        = $RegistryEntry.Server
-        Status        = $status
-        LastRun       = $lastStop.TimeCreated
-        Duration      = $lastStop.Duration
-        Details       = $lastStop.Details
-        ExitCode      = $lastStop.ExitCode
-        Critical      = [bool]$RegistryEntry.Critical
-        RecentRuns    = $recentRuns
+        Name       = $RegistryEntry.Name
+        Server     = $RegistryEntry.Server
+        Status     = $status
+        LastRun    = $lastStop.TimeCreated
+        Duration   = $lastStop.Duration
+        Details    = $lastStop.Details
+        ExitCode   = $lastStop.ExitCode
+        Critical   = [bool]$RegistryEntry.Critical
+        RecentRuns = $recentRuns
     }
 }
 
-# Generovani HTML dashboardu
+# HTML encode helper — odvozeny shortcut.
+function ConvertTo-HtmlSafe {
+    param([string]$Text)
+    if ([string]::IsNullOrEmpty($Text)) { return '' }
+    return [System.Net.WebUtility]::HtmlEncode($Text)
+}
+
+# Sanitizace id pro HTML/JS — whitelist jen bezpecnych znaku.
+function ConvertTo-SafeDomId {
+    param([string]$Text)
+    $clean = ($Text -replace '[^A-Za-z0-9_-]', '_')
+    return "detail-$clean"
+}
+
+# Generovani HTML dashboardu.
 function ConvertTo-DashboardHtml {
     param(
         [Parameter(Mandatory)][array]$Statuses
@@ -199,11 +256,12 @@ function ConvertTo-DashboardHtml {
 
     $generated = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
 
-    $countOk      = ($Statuses | Where-Object Status -eq 'OK').Count
-    $countWarning = ($Statuses | Where-Object Status -eq 'WARNING').Count
-    $countError   = ($Statuses | Where-Object Status -eq 'ERROR').Count
-    $countMissing = ($Statuses | Where-Object Status -eq 'MISSING').Count
-    $countRunning = ($Statuses | Where-Object Status -eq 'RUNNING').Count
+    # @(...) zaruci pole i pri prazdnem pipeline (jinak StrictMode 2.0 padne na .Count).
+    $countOk      = @($Statuses | Where-Object Status -eq 'OK').Count
+    $countWarning = @($Statuses | Where-Object Status -eq 'WARNING').Count
+    $countError   = @($Statuses | Where-Object Status -eq 'ERROR').Count
+    $countMissing = @($Statuses | Where-Object Status -eq 'MISSING').Count
+    $countRunning = @($Statuses | Where-Object Status -eq 'RUNNING').Count
 
     $statusColor = @{
         'OK'      = '#22c55e'
@@ -214,39 +272,50 @@ function ConvertTo-DashboardHtml {
     }
 
     $tableRows = foreach ($s in $Statuses) {
-        $color = $statusColor[$s.Status]
-        $lastRunText = if ($s.LastRun) { $s.LastRun.ToString('yyyy-MM-dd HH:mm') } else { '-' }
-        $durationText = if ($s.Duration) { $s.Duration } else { '-' }
-        $criticalBadge = if ($s.Critical) { ' <span class="badge-crit">CRITICAL</span>' } else { '' }
-        $detailsText = if ($s.Details) { $s.Details } else { '' }
-        $detailsEncoded = [System.Net.WebUtility]::HtmlEncode($detailsText)
-        $detailsShort = if ($detailsText.Length -gt 40) { [System.Net.WebUtility]::HtmlEncode($detailsText.Substring(0,40)) + '...' } else { $detailsEncoded }
+        $color          = $statusColor[$s.Status]
+        $nameHtml       = ConvertTo-HtmlSafe $s.Name
+        $serverHtml     = ConvertTo-HtmlSafe $s.Server
+        $statusHtml     = ConvertTo-HtmlSafe $s.Status
+        $lastRunText    = if ($s.LastRun) { $s.LastRun.ToString('yyyy-MM-dd HH:mm') } else { '-' }
+        $lastRunHtml    = ConvertTo-HtmlSafe $lastRunText
+        $durationText   = if ($s.Duration) { [string]$s.Duration } else { '-' }
+        $durationHtml   = ConvertTo-HtmlSafe $durationText
+        $criticalBadge  = if ($s.Critical) { ' <span class="badge-crit">CRITICAL</span>' } else { '' }
+        $detailsText    = if ($s.Details) { [string]$s.Details } else { '' }
+        $detailsEncoded = ConvertTo-HtmlSafe $detailsText
+        $detailsShort   = if ($detailsText.Length -gt 40) {
+            (ConvertTo-HtmlSafe $detailsText.Substring(0,40)) + '...'
+        } else {
+            $detailsEncoded
+        }
 
         $detailRows = ''
         if ($s.RecentRuns -and $s.RecentRuns.Count -gt 0) {
             $detailRows = ($s.RecentRuns | ForEach-Object {
                 $statusIcon = switch ($_.EventId) {
-                    1000 { '<span style="color:#22c55e">OK</span>' }
-                    1001 { '<span style="color:#eab308">WARN</span>' }
-                    1002 { '<span style="color:#ef4444">ERR</span>' }
+                    1000    { '<span style="color:#22c55e">OK</span>' }
+                    1001    { '<span style="color:#eab308">WARN</span>' }
+                    1002    { '<span style="color:#ef4444">ERR</span>' }
+                    default { '<span style="color:#9ca3af">?</span>' }
                 }
-                $runTime = $_.Time.ToString('yyyy-MM-dd HH:mm')
-                $dur = if ($_.Duration) { $_.Duration } else { '-' }
-                $items = if ($_.Items) { $_.Items } else { '-' }
-                $det = if ($_.Details) { [System.Net.WebUtility]::HtmlEncode($_.Details) } else { '-' }
+                $runTime = if ($_.Time) { ConvertTo-HtmlSafe $_.Time.ToString('yyyy-MM-dd HH:mm') } else { '-' }
+                # Explicitni kontrola null/empty — 0 je validni hodnota, nesmi se skryt.
+                $dur   = if ($null -ne $_.Duration -and "$($_.Duration)" -ne '') { ConvertTo-HtmlSafe ([string]$_.Duration) } else { '-' }
+                $items = if ($null -ne $_.Items    -and "$($_.Items)"    -ne '') { ConvertTo-HtmlSafe ([string]$_.Items)    } else { '-' }
+                $det   = if ($null -ne $_.Details  -and "$($_.Details)"  -ne '') { ConvertTo-HtmlSafe ([string]$_.Details)  } else { '-' }
                 "<tr><td>$runTime</td><td>$statusIcon</td><td>$dur</td><td>$items</td><td>$det</td></tr>"
             }) -join "`n"
         }
 
-        $detailId = "detail-$($s.Name -replace '\s','_')"
+        $detailId = ConvertTo-SafeDomId $s.Name
 
         @"
-<tr class="main-row" onclick="toggleDetail('$detailId')">
-    <td><strong>$($s.Name)</strong>$criticalBadge</td>
-    <td>$($s.Server)</td>
-    <td><span class="status" style="background:$color">$($s.Status)</span></td>
-    <td>$lastRunText</td>
-    <td>$durationText</td>
+<tr class="main-row" data-detail="$detailId">
+    <td><strong>$nameHtml</strong>$criticalBadge</td>
+    <td>$serverHtml</td>
+    <td><span class="status" style="background:$color">$statusHtml</span></td>
+    <td>$lastRunHtml</td>
+    <td>$durationHtml</td>
     <td title="$detailsEncoded">$detailsShort</td>
 </tr>
 <tr id="$detailId" class="detail-row" style="display:none">
@@ -261,6 +330,7 @@ function ConvertTo-DashboardHtml {
     }
 
     $tableRowsHtml = $tableRows -join "`n"
+    $generatedHtml = ConvertTo-HtmlSafe $generated
 
     return @"
 <!DOCTYPE html>
@@ -290,17 +360,11 @@ function ConvertTo-DashboardHtml {
         .detail-table td { padding: 4px 8px; font-size: 0.85rem; border-bottom: 1px solid #1e293b; }
         .detail-row td { background: #1a2332; padding: 0 12px; }
     </style>
-    <script>
-        function toggleDetail(id) {
-            var el = document.getElementById(id);
-            el.style.display = el.style.display === 'none' ? 'table-row' : 'none';
-        }
-    </script>
 </head>
 <body>
     <div class="header">
         <h1>Script Monitor Dashboard</h1>
-        <span class="generated">Aktualizovano: $generated</span>
+        <span class="generated">Aktualizovano: $generatedHtml</span>
     </div>
     <div class="summary">
         <div class="summary-item"><span class="count" style="color:#22c55e">$countOk</span> OK</div>
@@ -320,31 +384,79 @@ function ConvertTo-DashboardHtml {
         </tr>
         $tableRowsHtml
     </table>
+    <script>
+        // Handler pripojen pres addEventListener — nevklada user data do inline onclick atributu.
+        document.querySelectorAll('.main-row').forEach(function (row) {
+            row.addEventListener('click', function () {
+                var id = row.getAttribute('data-detail');
+                if (!id) { return; }
+                var el = document.getElementById(id);
+                if (!el) { return; }
+                el.style.display = (el.style.display === 'none') ? 'table-row' : 'none';
+            });
+        });
+    </script>
 </body>
 </html>
 "@
 }
 
-# --- Hlavni logika ---
+# Hlavni logika skriptu — samostatna funkce kvuli testovatelnosti (dot-source ze zkousek).
+function Invoke-MonitorScripts {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$RegistryPath,
+        [Parameter(Mandatory)][string]$OutputPath,
+        [int]$LookbackHours = 48
+    )
 
-$servers = $registry | Select-Object -ExpandProperty Server -Unique
-$allEvents = @()
-foreach ($server in $servers) {
-    $allEvents += Get-MonitorEvents -ServerName $server -Hours $LookbackHours
+    if (-not (Test-Path $RegistryPath)) {
+        throw "Registry soubor nenalezen: $RegistryPath"
+    }
+
+    $registryRaw = Get-Content $RegistryPath -Raw | ConvertFrom-Json
+    # ConvertFrom-Json vraci bud jedno PSCustomObject nebo pole — normalizuj.
+    $registry = @($registryRaw)
+
+    # Validace vsech zaznamu pred dalsim zpracovanim.
+    foreach ($entry in $registry) {
+        Test-RegistryEntry -Entry $entry
+    }
+
+    $servers = @($registry | Select-Object -ExpandProperty Server -Unique)
+    $allEvents = [System.Collections.Generic.List[object]]::new()
+    foreach ($server in $servers) {
+        $serverEvents = Get-MonitorEvents -ServerName $server -Hours $LookbackHours
+        foreach ($ev in $serverEvents) { $allEvents.Add($ev) | Out-Null }
+    }
+
+    $statuses = foreach ($entry in $registry) {
+        Get-ScriptStatus -RegistryEntry $entry -Events $allEvents.ToArray()
+    }
+
+    $html = ConvertTo-DashboardHtml -Statuses $statuses
+
+    $outputDir = Split-Path -Parent $OutputPath
+    if ($outputDir -and -not (Test-Path $outputDir)) {
+        New-Item -ItemType Directory -Path $outputDir -Force | Out-Null
+    }
+
+    $html | Out-File -FilePath $OutputPath -Encoding utf8 -Force
+    Write-Host "Dashboard vygenerovan: $OutputPath" -ForegroundColor Green
+    $statusesArr = @($statuses)
+    Write-Host ("Skriptu: {0} | OK: {1} | ERROR: {2} | MISSING: {3}" -f `
+        $statusesArr.Count,
+        (@($statusesArr | Where-Object Status -eq 'OK').Count),
+        (@($statusesArr | Where-Object Status -eq 'ERROR').Count),
+        (@($statusesArr | Where-Object Status -eq 'MISSING').Count))
 }
 
-$statuses = foreach ($entry in $registry) {
-    Get-ScriptStatus -RegistryEntry $entry -Events $allEvents
+# --- Entry point ---
+# Spusti main pouze pri primem spusteni skriptu (ne pri dot-source z testu).
+if ($MyInvocation.InvocationName -ne '.') {
+    $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
+    if (-not $RegistryPath) { $RegistryPath = Join-Path $ScriptDir 'scripts-registry.json' }
+    if (-not $OutputPath)   { $OutputPath   = Join-Path $ScriptDir 'dashboard.html' }
+
+    Invoke-MonitorScripts -RegistryPath $RegistryPath -OutputPath $OutputPath -LookbackHours $LookbackHours
 }
-
-# --- Generovani HTML ---
-$html = ConvertTo-DashboardHtml -Statuses $statuses
-
-$outputDir = Split-Path -Parent $OutputPath
-if ($outputDir -and -not (Test-Path $outputDir)) {
-    New-Item -ItemType Directory -Path $outputDir -Force | Out-Null
-}
-
-$html | Out-File -FilePath $OutputPath -Encoding utf8 -Force
-Write-Host "Dashboard vygenerovan: $OutputPath" -ForegroundColor Green
-Write-Host "Skriptu: $($statuses.Count) | OK: $(($statuses | Where-Object Status -eq 'OK').Count) | ERROR: $(($statuses | Where-Object Status -eq 'ERROR').Count) | MISSING: $(($statuses | Where-Object Status -eq 'MISSING').Count)"
